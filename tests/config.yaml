@@ -1,0 +1,98 @@
+hydra:
+  sweeper:
+    params:
+      +training_kwargs.learning_rate: 0.0002
+inference_config:
+  model_loading_config:
+    model_path: NousResearch/Llama-2-7b-hf
+    loading_type: regular
+    loading_kwargs:
+      device_map: auto
+      use_cache: false
+  preprocess_config:
+    steps:
+      - name: TextStripProcessor
+        params:
+          apply_to_labels: false
+      - name: RegexReplaceProcessor
+        params:
+          pattern: "^[\"']|[\"']$"
+          repl: ""
+          apply_to_labels: false
+      - name: DedupComponent
+        params:
+          by_features: true
+          by_label : false
+          keep_strategy: "first"
+      - name: PromptingComponent
+        params:
+          delimiter: "\n\n"
+          sample_fields:
+            - "### HTML Dom - "
+            - "### HTML Element - "
+          label_field: "### Description - "
+    mode: 0
+
+data_loading_config:
+  dataset_config:
+    paths:
+      - "../../data/data-crestron1-nlp.csv"
+      - "../../data/data-2-crestron1-nlp.csv"
+    test_size: 0.2
+    batch_size: ${sweeper:${.target.task_name}.batch_size}  # Use batch size from sweeper
+    data_adapter_config:
+      data_adapter_type: hf_to_sample
+      data_adapter_kwargs:
+        label_key: description
+        sample_keys:
+          - html
+          - html_element
+      data_adapter_result_key: prompt
+    mode: 0
+    seed: 1337
+  splits_to_preprocess:
+    - train
+
+# You can add or modify other configurations as needed...
+
+output_dirs:
+  artifacts_dir: "../../outputs/artifacts"
+  logs_dir: "../../outputs/logs"
+
+artifacts_dir: null
+logs_dir: null
+
+training_kwargs:
+  num_train_epochs: 8
+  per_device_train_batch_size: 1
+  logging_strategy: steps
+  logging_first_step: true
+  gradient_accumulation_steps: 4
+  gradient_checkpointing: true
+  optim: paged_adamw_32bit
+  logging_steps: 10
+  save_strategy: epoch
+  learning_rate: 0.02
+  fp16: true
+  max_grad_norm: 0.3
+  warmup_ratio: 0.03
+  lr_scheduler_type: constant
+  disable_tqdm: true
+
+lora_config_kwargs:
+  lora_alpha: 16
+  lora_dropout: 0.1
+  r: 64
+  bias: none
+  task_type: CAUSAL_LM
+
+bnb_config_kwargs:
+  load_in_4bit: true
+  bnb_4bit_use_double_quant: true
+  bnb_4bit_quant_type: nf4
+  bnb_4bit_compute_dtype: bfloat16
+
+max_seq_length: 2048
+train_split: train
+test_split: null
+train_on_completion_only: false
