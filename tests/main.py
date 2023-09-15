@@ -117,9 +117,6 @@ from omegaconf import OmegaConf
 def run_training(cfg: DictConfig):
     cfg: ExperimentConfig = ExperimentConfig(**cfg)
     json.dump(cfg.model_dump(), open('config.json', 'w'), cls=HydraConfigEncoder)
-    args = TrainingArguments(
-        output_dir=cfg.artifacts_dir, logging_dir=cfg.logs_dir, **cfg.training_kwargs
-    )
 
     pipeline = cfg.inference_config.preprocess_config.to_pipeline()
     dataset = load_and_preprocess_data(cfg.data_loading_config, pipeline)
@@ -166,6 +163,10 @@ def run_training(cfg: DictConfig):
     if cfg.train_on_completion_only:
         response_template = [step.label_field for step in pipeline.steps if isinstance(step, PromptingComponent)][0]
         collator = DataCollatorForCompletionOnlyLM(response_template, tokenizer=tokenizer)  
+
+    args = TrainingArguments(
+        output_dir=cfg.artifacts_dir, logging_dir=cfg.logs_dir, **cfg.training_kwargs
+    )
 
 
     trainer = SFTTrainer(
