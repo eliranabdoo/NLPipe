@@ -66,7 +66,7 @@ class NLDataCooker(Generic[Data], NLComponent, metaclass=ABCMeta):
     
 
 
-class NLPipelineOperator(Generic[Data], metaclass=ABCMeta):
+class NLPipelineOperator(Generic[Data], NLComponent, metaclass=ABCMeta):
     @abstractmethod
     def execute(self, pipeline: NLPipeline, data_mapping: Dict[str, Data]):
         pass
@@ -166,9 +166,16 @@ class HuggingfaceNLModel(NLModel):
 
 from datasets import Dataset as HFDataset
 
+class HuggingFaceNLTrainerConfig(NLConfig):
+
 class HuggingFaceNLTrainer(NLPipelineOperator[HFDataset], metaclass=ABCMeta):
     train_split = "train"
     eval_split = "eval"
+    cfg: HuggingFaceNLTrainerConfig
+
+    def from_config(cls, config):
+        self.cfg = config
+
     def execute(self, pipeline: NLPipeline[HuggingfaceNLModel], data_mapping: Dict[str, HFDataset]):
         if set(data_mapping.keys()).issubset({self.train_split, self.eval_split}):
             raise ValueError("invalid data mapping keys")
