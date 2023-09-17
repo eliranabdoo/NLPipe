@@ -1,11 +1,13 @@
 from dataclasses import dataclass
 from enum import Enum
 import importlib
-from typing import Any, Dict, Generic, Literal, Optional, Tuple, TypeVar
+from typing import Any, Callable, Dict, Generic, Literal, Optional, Tuple, TypeVar
 
 from pydantic import BaseModel
 import torch
-from .preprocess import ProcessingPipeline
+
+from src.evaluation import MetricsConfig, get_compute_metrics_func
+from .preprocess import ProcessingPipeline, PromptingComponent
 
 from abc import abstractclassmethod, ABCMeta, abstractmethod
 
@@ -63,8 +65,6 @@ class NLDataCooker(Generic[Data], NLComponent, metaclass=ABCMeta):
     def _cook_data(self, data: Data):
         return self.processing_pipeline.process(data)
 
-    
-
 
 class NLPipelineOperator(Generic[Data], NLComponent, metaclass=ABCMeta):
     @abstractmethod
@@ -94,7 +94,7 @@ from transformers import AutoModel, AutoTokenizer, AutoModelForCausalLM
 from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
 from peft import LoraConfig, prepare_model_for_kbit_training, get_peft_model
 from transformers import TrainingArguments
-
+from trl import SFTTrainer,DataCollatorForCompletionOnlyLM
 
 class HuggingfaceLoadingModules(str, Enum):
     TRANSFORMERS = "transformers"
@@ -139,7 +139,6 @@ class HuggingfaceNLModel(NLModel):
             BitsAndBytesConfig(**cfg.bnb_config) if cfg.bnb_config is not None else None
         )
 
-
         model_loading_kwargs = cfg.loading_kwargs
 
         if bnb_config is not None:
@@ -164,9 +163,16 @@ class HuggingfaceNLModel(NLModel):
 
         return cls(model=model, tokenizer=tokenizer)
 
+
 from datasets import Dataset as HFDataset
 
+
 class HuggingFaceNLTrainerConfig(NLConfig):
+    kind: Literal['hf'] = "hf"
+    max_sequence_length: int
+    training_args: TrainingArguments
+    metrics_config: MetricsConfig
+
 
 class HuggingFaceNLTrainer(NLPipelineOperator[HFDataset], metaclass=ABCMeta):
     train_split = "train"
@@ -174,53 +180,106 @@ class HuggingFaceNLTrainer(NLPipelineOperator[HFDataset], metaclass=ABCMeta):
     cfg: HuggingFaceNLTrainerConfig
 
     def from_config(cls, config):
-        self.cfg = config
+        return cls(config)
 
-    def execute(self, pipeline: NLPipeline[HuggingfaceNLModel], data_mapping: Dict[str, HFDataset]):
+    def __init__(self, cfg: HuggingFaceNLTrainerConfig):
+        self.cfg = cfg
+
+    @abstractmethod
+    def get_trainer(
+        self,
+        preprocess_pipeline: ProcessingPipeline,
+        model: AutoModel,
+        tokenizer: AutoTokenizer,
+        train_dataset: HFDataset,
+        eval_dataset: HFDataset,
+        max_seq_length: int,
+        training_args: TrainingArguments,
+        compute_metrics: Optional[Callable]
+    ) -> Dict:
+        pass
+
+    def execute(
+        self,
+        pipeline: NLPipeline[HuggingfaceNLModel],
+        data_mapping: Dict[str, HFDataset],
+    ):
         if set(data_mapping.keys()).issubset({self.train_split, self.eval_split}):
             raise ValueError("invalid data mapping keys")
 
         model, tokenizer = pipeline.model.model, pipeline.model.tokenizer
-        
-        trainer_kwargs = {}
-        if cfg.metrics_config is not None:
-            compute_metrics = get_compute_metrics_func(cfg.metrics_config)
-            trainer_kwargs["compute_metrics"] = compute_metrics
-
 
         train_dataset = data_mapping[self.train_split]
         eval_dataset = data_mapping.get(self.eval_split, None)
 
-        collator = None
-        if cfg.train_on_completion_only:
-            response_template = [step.label_field for step in pipeline.steps if isinstance(step, PromptingComponent)][0]
-            collator = DataCollatorForCompletionOnlyLM(response_template, tokenizer=tokenizer)  
+        max_seq_length = self.cfg.max_sequence_length
 
-        args = TrainingArguments(
-            output_dir=cfg.artifacts_dir, logging_dir=cfg.logs_dir, **cfg.training_kwargs
+        training_args = self.cfg.training_args
+
+        compute_metrics = None
+        if self.cfg.metrics_config is not None:
+            compute_metrics = get_compute_metrics_func(self.cfg.metrics_config, pipeline.postprocessing_pipeline)
+
+        # TODO PREPROCESS
+
+        trainer = self.get_trainer(
+            preprocess_pipeline=pipeline.preprocessing_pipeline,
+            model=model,
+            tokenizer=tokenizer,
+            train_dataset=train_dataset,
+            eval_dataset=eval_dataset,
+            max_seq_length=max_seq_length,
+            training_args=training_args,
+            compute_metrics=compute_metrics
         )
+        trainer.train()
 
+
+class HuggingFaceSFTNLTrainerConfig(HuggingFaceNLTrainerConfig):
+    kind: Literal["hf_sft"] = "hf_sft"
+    train_on_completion_only: bool
+    text_field: str
+
+
+
+class HuggingFaceSFTNLTrainer(HuggingFaceNLTrainer):
+    cfg: HuggingFaceSFTNLTrainerConfig
+
+    def get_trainer(
+        self,
+        preprocess_pipeline: ProcessingPipeline,
+        model: AutoModel,
+        tokenizer: AutoTokenizer,
+        train_dataset: HFDataset,
+        eval_dataset: Optional[HFDataset],
+        max_seq_length: int,
+        training_args: TrainingArguments,
+        compute_metrics: Optional[Callable]
+    ) -> Dict:
+        collator = None
+        if self.cfg.train_on_completion_only:
+            response_template = next(
+                step.delimiter + step.label_field
+                for step in preprocess_pipeline.steps[::-1]
+                if isinstance(step, PromptingComponent)
+            )
+            response_template_ids = tokenizer.encode(response_template, add_special_tokens=False)
+            collator = DataCollatorForCompletionOnlyLM(
+                response_template_ids, tokenizer=tokenizer
+            )
 
         trainer = SFTTrainer(
             model=model,
             train_dataset=train_dataset,
             eval_dataset=eval_dataset,
-            peft_config=lora_config,
-            max_seq_length=cfg.max_seq_length,
+            max_seq_length=max_seq_length,
             tokenizer=tokenizer,
-            args=args,
-            dataset_text_field=cfg.data_loading_config.dataset_config.data_adapter_config.data_adapter_result_key,
+            args=training_args,
+            dataset_text_field=self.cfg.text_field,
             data_collator=collator,
-            **trainer_kwargs
+            compute_metrics=compute_metrics
         )
-        trainer.train()
-
-
-
-
-class HuggingFaceNLTrainer(NLPipelineOperator):
-    pass
-
+        return trainer
 
 class HuggingFaceNLGenerator(NLPipelineOperator):
     pass
