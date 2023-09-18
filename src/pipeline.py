@@ -1,10 +1,11 @@
 from dataclasses import dataclass
 from enum import Enum
 import importlib
-from typing import Any, Callable, Dict, Generic, Literal, Optional, Tuple, TypeVar
+from typing import Any, Callable, Dict, Generic, Literal, Optional, Tuple, Type, TypeVar
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 import torch
+from tqdm import tqdm
 
 from src.evaluation import MetricsConfig, get_compute_metrics_func
 from .preprocess import ProcessingPipeline, PromptingComponent
@@ -87,14 +88,44 @@ class NLExperiment(NLComponent, metaclass=ABCMeta):
         data_container: NLDataContainer,
     ) -> NLExperimentOutcome:
         cooked_data_container = self.data_cooker.cook(data_container)
-        self.task.execute(self.pipeline, cooked_data_container)
+        result = self.task.execute(self.pipeline, cooked_data_container)
+        result = self.get_converter(type(self.task))(result)
+        self.handle_result(result)
+
+    def get_converter(self, task_type: Type[NLPipelineOperator]) -> Callable:
+        if task_type == "Huggingface":
+            def convert(result) -> NLExperimentOutcome:
+                df = dataset.to_pandas()
+                df["preds"] = preds
+
+                preds_dir = os.path.join(prediction_cfg.pred_dir, prediction_cfg.uid)
+                os.makedirs(preds_dir)
+                df.to_csv(os.path.join(preds_dir, "preds.csv"))
+                json.dump(
+                    prediction_cfg.model_dump(),
+                    open(os.path.join(preds_dir, "config.json"), "w"),
+                    cls=HydraConfigEncoder,
+                )
+
+                if metrics_cfg is not None:
+                    compute_metrics = get_compute_metrics_func(metrics_cfg)
+                    metrics_result = compute_metrics(
+                        [df["preds"].to_list(), [[ref] for ref in df["description"].to_list()]]
+                    )
+                    json.dump(metrics_result, open(os.path.join(preds_dir, "metrics.json"), "w"))
+
+                return preds
+
+    def handle_result(self, result: NLExperimentOutcome):
+        pass
 
 
 from transformers import AutoModel, AutoTokenizer, AutoModelForCausalLM
 from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
 from peft import LoraConfig, prepare_model_for_kbit_training, get_peft_model
 from transformers import TrainingArguments
-from trl import SFTTrainer,DataCollatorForCompletionOnlyLM
+from trl import SFTTrainer, DataCollatorForCompletionOnlyLM
+
 
 class HuggingfaceLoadingModules(str, Enum):
     TRANSFORMERS = "transformers"
@@ -168,7 +199,7 @@ from datasets import Dataset as HFDataset
 
 
 class HuggingFaceNLTrainerConfig(NLConfig):
-    kind: Literal['hf'] = "hf"
+    kind: Literal["hf"] = "hf"
     max_sequence_length: int
     training_args: TrainingArguments
     metrics_config: MetricsConfig
@@ -195,7 +226,7 @@ class HuggingFaceNLTrainer(NLPipelineOperator[HFDataset], metaclass=ABCMeta):
         eval_dataset: HFDataset,
         max_seq_length: int,
         training_args: TrainingArguments,
-        compute_metrics: Optional[Callable]
+        compute_metrics: Optional[Callable],
     ) -> Dict:
         pass
 
@@ -218,7 +249,9 @@ class HuggingFaceNLTrainer(NLPipelineOperator[HFDataset], metaclass=ABCMeta):
 
         compute_metrics = None
         if self.cfg.metrics_config is not None:
-            compute_metrics = get_compute_metrics_func(self.cfg.metrics_config, pipeline.postprocessing_pipeline)
+            compute_metrics = get_compute_metrics_func(
+                self.cfg.metrics_config, pipeline.postprocessing_pipeline
+            )
 
         # TODO PREPROCESS
 
@@ -230,7 +263,7 @@ class HuggingFaceNLTrainer(NLPipelineOperator[HFDataset], metaclass=ABCMeta):
             eval_dataset=eval_dataset,
             max_seq_length=max_seq_length,
             training_args=training_args,
-            compute_metrics=compute_metrics
+            compute_metrics=compute_metrics,
         )
         trainer.train()
 
@@ -239,7 +272,6 @@ class HuggingFaceSFTNLTrainerConfig(HuggingFaceNLTrainerConfig):
     kind: Literal["hf_sft"] = "hf_sft"
     train_on_completion_only: bool
     text_field: str
-
 
 
 class HuggingFaceSFTNLTrainer(HuggingFaceNLTrainer):
@@ -254,7 +286,7 @@ class HuggingFaceSFTNLTrainer(HuggingFaceNLTrainer):
         eval_dataset: Optional[HFDataset],
         max_seq_length: int,
         training_args: TrainingArguments,
-        compute_metrics: Optional[Callable]
+        compute_metrics: Optional[Callable],
     ) -> Dict:
         collator = None
         if self.cfg.train_on_completion_only:
@@ -263,7 +295,9 @@ class HuggingFaceSFTNLTrainer(HuggingFaceNLTrainer):
                 for step in preprocess_pipeline.steps[::-1]
                 if isinstance(step, PromptingComponent)
             )
-            response_template_ids = tokenizer.encode(response_template, add_special_tokens=False)
+            response_template_ids = tokenizer.encode(
+                response_template, add_special_tokens=False
+            )
             collator = DataCollatorForCompletionOnlyLM(
                 response_template_ids, tokenizer=tokenizer
             )
@@ -277,12 +311,62 @@ class HuggingFaceSFTNLTrainer(HuggingFaceNLTrainer):
             args=training_args,
             dataset_text_field=self.cfg.text_field,
             data_collator=collator,
-            compute_metrics=compute_metrics
+            compute_metrics=compute_metrics,
         )
         return trainer
 
+
+class HuggingFaceNLGeneratorConfig(NLConfig):
+    kind: Literal["hf"] = "hf"
+    generation_kwargs: Dict = Field(
+        default_factory=lambda: dict(
+            max_new_tokens=30,
+            do_sample=True,
+            top_p=0.9,
+            temperature=0.9,
+        )
+    )
+    tokenization_kwargs: Dict = Field(
+        default_factory=lambda: dict(
+            return_tensors="pt", truncation=True, max_length=512
+        )
+    )
+    use_tqdm: bool
+    data_device: str = "cuda"
+
+
 class HuggingFaceNLGenerator(NLPipelineOperator):
-    pass
+    cfg: HuggingFaceNLGeneratorConfig
+
+    def execute(
+        self, pipeline: NLPipeline[HuggingfaceNLModel], data_mapping: Dict[str, Any]
+    ):
+        results = {}
+        for data_name, data in data_mapping.values():
+            samples = (datum[0] for datum in data)
+            samples = pipeline.preprocessing_pipeline.process(
+                samples
+            )  # TODO think about split-process-merge paradigm
+            if self.cfg.use_tqdm:
+                samples = tqdm(samples, total=len(data))
+            preds = []
+            for sample in samples:
+                input_ids = pipeline.tokenizer(
+                    sample, **self.cfg.tokenization_kwargs
+                ).input_ids.to(self.cfg.data_device)
+                with torch.inference_mode():
+                    outputs = pipeline.model.generate(
+                        input_ids=input_ids, **self.cfg.generation_kwargs
+                    )
+                pred = pipeline.tokenizer.batch_decode(
+                    outputs.detach().cpu().numpy(), skip_special_tokens=True
+                )[0][len(sample) :]
+                preds.append(pred)
+            preds = pipeline.postprocessing_pipeline.process(preds)
+            results[data_name] = preds
+
+        return results
+    
 
 
 # class HuggingfaceModelPatchCatalog(str, Enum):
