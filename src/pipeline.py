@@ -105,6 +105,10 @@ class NLExperimentOutcome(metaclass=ABCMeta):
 
 
 class NLExperiment(NLComponent, metaclass=ABCMeta):
+    """An experiment will take a pipeline, a data cooker and an operator,
+    and apply the pipeline according to the operator, on the cooked data
+    
+    An ExperimentOutcome object should contain different information according to the task"""
     pipeline: NLPipeline
     data_cooker: NLDataCooker
     task: NLPipelineOperator
@@ -286,6 +290,19 @@ class HuggingfaceDataAdapter(Generic[Data], metaclass=ABCMeta):
     def get_type() -> HuggingfaceDataAdapterType:
         pass
 
+class TextHuggingfaceDataAdapter(HuggingfaceDataAdapter):
+    @staticmethod
+    def get_type():
+        return HuggingfaceDataAdapterType.TEXT
+    
+    def batch_to_data(batch: Dict) -> Data:
+        pass
+
+    def data_to_batch(data: Data) -> Dict:
+        pass
+
+    
+
 
 class HuggingFaceNLTrainer(NLPipelineOperator[HFDataset], metaclass=ABCMeta):
     train_split = "train"
@@ -442,25 +459,10 @@ class NLPredictor(NLPipelineOperator):
         results = {}
         for data_name, data in data_mapping.values():
             samples = (datum[0] for datum in data)
-            samples = pipeline.preprocessing_pipeline.process(
-                samples
-            )  # TODO think about split-process-merge paradigm
+            # TODO think about split-process-merge paradigm
             if self.cfg.use_tqdm:
                 samples = tqdm(samples, total=len(data))
-            preds = []
-            for sample in samples:
-                input_ids = pipeline.tokenizer(
-                    sample, **self.cfg.tokenization_kwargs
-                ).input_ids.to(self.cfg.data_device)
-                with torch.inference_mode():
-                    outputs = pipeline.model.generate(
-                        input_ids=input_ids, **self.cfg.generation_kwargs
-                    )
-                pred = pipeline.tokenizer.batch_decode(
-                    outputs.detach().cpu().numpy(), skip_special_tokens=True
-                )[0][len(sample) :]
-                preds.append(pred)
-            preds = pipeline.postprocessing_pipeline.process(preds)
+            preds = pipeline.predict(samples, processing_mode=ProcessingMode.INFERENCE)
             results[data_name] = preds
 
         return results
